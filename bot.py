@@ -27,13 +27,13 @@ import requests
 # Config -- edit WATCHLISTS here. Secrets come from environment variables.
 # ----------------------------------------------------------------------------
 
-IDX_STOCKS = ["BBCA", "BBRI", "TLKM", "ANTM", "ASII"]      # IDX tickers (no .JK)
+IDX_STOCKS = ["^JKSE", "BBCA", "BBRI", "TLKM", "ANTM", "ASII"]  # ^JKSE = IDX Composite (JCI)
 FOREX_PAIRS = ["USD/IDR", "EUR/IDR", "EUR/USD", "GBP/USD"]  # base/quote
 CRYPTO = ["BTCUSDT", "ETHUSDT"]                            # Binance symbols
 # Commodity proxies traded on global exchanges / ETFs that track Indonesian exports.
-# CPO -> FCPO is hard to get free; we proxy palm oil + coal + nickel via crypto-free
-# public sources. Here we use forex-style metal proxies through Finnhub if available.
-COMMODITY_PROXIES = ["OANDA:XCU_USD"]  # copper as nickel/industrial-metal sentiment proxy
+# True CPO/coal/nickel futures need a paid feed. Free industrial-metal proxies aren't
+# reliably available, so the free build omits commodities. Add a paid source later.
+COMMODITY_PROXIES = []  # disabled on the free tier (see README)
 
 TIMEFRAME = "D"          # daily bars for swing context
 LOOKBACK_BARS = 120      # ~6 months of daily bars for wave context
@@ -44,8 +44,9 @@ ANTHROPIC_VERSION = "2023-06-01"
 # Secrets (set as GitHub Actions secrets / env vars)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-ITICK_API_KEY = os.environ.get("ITICK_API_KEY", "")
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+# Data sources are now all keyless:
+#   IDX stocks -> Yahoo Finance | forex -> Frankfurter | crypto -> Coinbase
+# Only ANTHROPIC_API_KEY and DISCORD_WEBHOOK_URL are required.
 
 TIMEOUT = 20
 
@@ -65,59 +66,81 @@ def safe_get(url: str, **kwargs) -> Optional[dict]:
         return None
 
 
+def _yahoo_chart(yahoo_symbol: str) -> Optional[list]:
+    """Daily closes from Yahoo Finance public chart endpoint (no key, no geo-block)."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    params = {"range": "6mo", "interval": "1d"}
+    data = safe_get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        res = data["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+        return closes[-LOOKBACK_BARS:] if closes else None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def fetch_idx_bars(symbol: str) -> Optional[list]:
-    """IDX daily bars via iTick. interval 8 = daily."""
-    if not ITICK_API_KEY:
+    """IDX daily closes via Yahoo Finance. IDX tickers use the .JK suffix.
+
+    Returns a list of iTick-style dicts {"c": close} so build_market_snapshot's
+    existing parsing keeps working unchanged.
+    """
+    yahoo_sym = symbol if symbol.startswith("^") else f"{symbol}.JK"
+    closes = _yahoo_chart(yahoo_sym)
+    if not closes:
         return None
-    headers = {"token": ITICK_API_KEY}
-    params = {"region": "ID", "code": symbol, "interval": "8", "limit": LOOKBACK_BARS}
-    data = safe_get("https://api.itick.org/stock/kline", headers=headers, params=params)
-    if not data:
-        return None
-    return data.get("data")
+    return [{"c": c} for c in closes]
 
 
 def fetch_forex(pair: str) -> Optional[dict]:
-    """Latest forex quote via Finnhub. pair like 'USD/IDR'."""
-    if not FINNHUB_API_KEY:
-        return None
+    """Daily forex time-series via Frankfurter (no key, no geo-block).
+
+    Returns {"c": [closes...]} to match the rest of the pipeline.
+    pair like 'USD/IDR' -> from=USD, to=IDR.
+    """
     base, quote = pair.split("/")
-    sym = f"OANDA:{base}_{quote}"
-    data = safe_get(
-        "https://finnhub.io/api/v1/forex/candle",
-        params={"symbol": sym, "resolution": "D", "count": LOOKBACK_BARS,
-                "token": FINNHUB_API_KEY},
-    )
-    if data and data.get("s") == "ok":
-        return data
-    # Fallback: spot rate only via exchangerate.host (no key)
-    spot = safe_get(f"https://api.exchangerate.host/latest",
-                    params={"base": base, "symbols": quote})
-    if spot and spot.get("rates"):
-        return {"spot": spot["rates"].get(quote)}
-    return None
+    end = dt.date.today()
+    start = end - dt.timedelta(days=int(LOOKBACK_BARS * 1.6) + 10)  # pad for weekends/holidays
+    url = (f"https://api.frankfurter.dev/v1/{start.isoformat()}..{end.isoformat()}"
+           f"?base={base}&symbols={quote}")
+    data = safe_get(url)
+    if not data or "rates" not in data:
+        return None
+    # rates is a dict keyed by date -> {quote: value}; sort by date ascending.
+    closes = [v[quote] for _, v in sorted(data["rates"].items()) if quote in v]
+    if not closes:
+        return None
+    return {"c": closes[-LOOKBACK_BARS:]}
 
 
 def fetch_crypto(symbol: str) -> Optional[list]:
-    """Binance public klines -- no API key required."""
+    """Daily crypto candles via Coinbase (no key, not geo-blocked like Binance).
+
+    Accepts Binance-style symbols ('BTCUSDT') and maps to Coinbase ('BTC-USD').
+    Returns a Binance-style list so downstream parsing is unchanged:
+    [openTime, o, h, l, c, v]
+    """
+    s = symbol.upper().replace("USDT", "USD")
+    # insert dash before the 3-char quote (USD/EUR etc.)
+    product = f"{s[:-3]}-{s[-3:]}"
     data = safe_get(
-        "https://api.binance.com/api/v3/klines",
-        params={"symbol": symbol, "interval": "1d", "limit": LOOKBACK_BARS},
+        f"https://api.exchange.coinbase.com/products/{product}/candles",
+        params={"granularity": 86400},  # 1 day; returns up to 300 candles, newest first
+        headers={"User-Agent": "daily-report-bot"},
     )
-    return data  # list of [openTime, o, h, l, c, v, ...]
+    if not data or not isinstance(data, list):
+        return None
+    # Coinbase row: [time, low, high, open, close, volume], newest first -> reverse.
+    rows = list(reversed(data))[-LOOKBACK_BARS:]
+    return [[r[0], r[3], r[2], r[1], r[4], r[5]] for r in rows]
 
 
 def fetch_commodity(symbol: str) -> Optional[dict]:
-    """Industrial-metal / commodity proxy via Finnhub forex-style endpoint."""
-    if not FINNHUB_API_KEY:
-        return None
-    data = safe_get(
-        "https://finnhub.io/api/v1/forex/candle",
-        params={"symbol": symbol, "resolution": "D", "count": LOOKBACK_BARS,
-                "token": FINNHUB_API_KEY},
-    )
-    if data and data.get("s") == "ok":
-        return data
+    """Commodities require a paid feed on the free tier -- disabled.
+
+    COMMODITY_PROXIES is empty, so this is never called in the free build.
+    Kept as a stub so you can wire in a paid source later.
+    """
     return None
 
 
@@ -163,7 +186,7 @@ def summarize_closes(closes: list) -> dict:
 
 def build_market_snapshot() -> dict:
     """Gather everything into one structured object for Claude."""
-    snapshot = {"generated_utc": dt.datetime.utcnow().isoformat() + "Z",
+    snapshot = {"generated_utc": dt.datetime.now(dt.timezone.utc).isoformat() + "Z",
                 "idx_stocks": {}, "forex": {}, "crypto": {}, "commodities": {}}
 
     for sym in IDX_STOCKS:
@@ -270,7 +293,7 @@ def post_to_discord(report: str):
         print(report)
         return
 
-    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     header = f"**📊 Daily Indonesian Markets Report — {today} UTC**\n*Research only, not investment advice.*\n"
     chunks = chunk_text(header + "\n" + report, 1900)
 
