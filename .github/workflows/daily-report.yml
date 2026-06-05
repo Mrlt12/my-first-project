@@ -1,0 +1,32 @@
+name: Daily Trading Report
+
+on:
+  schedule:
+    # GitHub Actions cron is in UTC. WIB = UTC+7.
+    # IDX closes ~16:00 WIB = 09:00 UTC. Run at 09:30 UTC (16:30 WIB).
+    - cron: "30 9 * * 1-5"   # Mon–Fri only
+  workflow_dispatch: {}        # lets you trigger manually from the Actions tab
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ITICK_API_KEY: ${{ secrets.ITICK_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python bot.py
