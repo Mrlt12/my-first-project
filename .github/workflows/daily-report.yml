@@ -2,10 +2,12 @@ name: Daily Trading Report
 
 on:
   schedule:
-    # GitHub Actions cron is in UTC. WIB = UTC+7.
-    # IDX closes ~16:00 WIB = 09:00 UTC. Run at 09:30 UTC (16:30 WIB).
-    - cron: "30 9 * * 1-5"   # Mon–Fri only
-  workflow_dispatch: {}        # lets you trigger manually from the Actions tab
+    # 10:15 UTC = 17:15 WIB, allowing time for post-close IDX data updates.
+    - cron: "15 10 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 jobs:
   report:
@@ -21,12 +23,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Run daily report
+      - name: Validate Python syntax
+        run: python -m py_compile bot.py
+
+      - name: Run and deliver report
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          ITICK_API_KEY: ${{ secrets.ITICK_API_KEY }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          # Optional. The verified numerical report works without Anthropic.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: claude-sonnet-5
         run: python bot.py
